@@ -77,7 +77,7 @@ function AddUserModal({ onClose, refetch }) {
     <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center z-50">
       <div className="bg-white rounded-2xl shadow-xl w-[480px] p-8">
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-lg font-semibold text-gray-900">Add New User</h2>
+          <h2 className="text-lg font-semibold text-gray-900 font-funnel">Add New User</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
@@ -129,7 +129,7 @@ function AddUserModal({ onClose, refetch }) {
           <button
             disabled={!form.email || !form.name || !form.password || !form.role || loading}
             onClick={() => createUser({ variables: { ...form } })}
-            className="bg-brand-purple text-white rounded-full px-6 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity"
+            className="bg-brand-purple text-white rounded-full px-6 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity font-funnel"
           >
             Add User
           </button>
@@ -167,7 +167,7 @@ function EditUserModal({ user, onClose, refetch }) {
             <div className="w-7 h-7 rounded-full bg-brand-purple/20 flex items-center justify-center">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9333ea" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
             </div>
-            <h2 className="text-lg font-semibold text-gray-900">Edit User</h2>
+            <h2 className="text-lg font-semibold text-gray-900 font-funnel">Edit User</h2>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -217,7 +217,7 @@ function EditUserModal({ user, onClose, refetch }) {
           <button
             disabled={loading}
             onClick={handleUpdate}
-            className="bg-brand-purple text-white rounded-full px-6 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity"
+            className="bg-brand-purple text-white rounded-full px-6 py-2 text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity font-funnel"
           >
             {loading ? 'Saving…' : 'Update'}
           </button>
@@ -232,24 +232,26 @@ function DeleteUserModal({ user, onClose, onConfirm, loading }) {
   return (
     <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center z-50">
       <div className="bg-white rounded-2xl shadow-xl w-[400px] p-8 text-center">
-        <div className="w-14 h-14 rounded-full bg-brand-purple/15 flex items-center justify-center mx-auto mb-4">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#9333ea" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+        <div className="w-16 h-16 rounded-full bg-brand-purple/10 flex items-center justify-center mx-auto mb-4">
+          <div className="w-11 h-11 rounded-full border-2 border-brand-purple/40 flex items-center justify-center">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9333ea" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </div>
         </div>
-        <h2 className="text-lg font-semibold text-gray-900 mb-2">Delete User</h2>
+        <h2 className="text-lg font-semibold text-gray-900 mb-2 font-funnel">Delete User</h2>
         <p className="text-sm text-gray-500 mb-6">
           Are you sure you want to delete this user? This action cannot be undone and will remove all associated data.
         </p>
         <div className="flex gap-3 justify-center">
           <button
             onClick={onClose}
-            className="px-6 py-2 rounded-full border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+            className="px-6 py-2 rounded-full border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition-colors font-funnel"
           >
             No, Cancel
           </button>
           <button
             disabled={loading}
             onClick={onConfirm}
-            className="px-6 py-2 rounded-full bg-brand-purple text-white text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity"
+            className="px-6 py-2 rounded-full bg-brand-purple text-white text-sm font-medium hover:opacity-90 disabled:opacity-40 transition-opacity font-funnel"
           >
             {loading ? 'Deleting…' : 'Yes, Delete'}
           </button>
@@ -285,7 +287,7 @@ export default function Dashboard() {
           </div>
           <button
             onClick={() => setAddModal(true)}
-            className="flex items-center gap-1.5 bg-brand-dark-blue text-white text-sm font-medium px-4 py-2 rounded-full hover:opacity-90 transition-opacity"
+            className="flex items-center gap-1.5 bg-brand-dark-blue text-white text-sm font-medium px-4 py-2 rounded-full hover:opacity-90 transition-opacity font-funnel"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             New User

@@ -1,5 +1,6 @@
 import React from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
+import logoSvg from '../../assets/Logo SVG 1.svg';
 
 function getUser() {
   try {
@@ -33,23 +34,18 @@ export default function TopNav() {
 
   return (
     <div className="bg-brand-light-blue px-4 pt-4 pb-2">
-      <header className="bg-brand-dark-blue rounded-full px-6 py-2.5 flex items-center justify-between">
+      <header className="bg-brand-dark-blue rounded-full px-6 flex items-stretch justify-between" style={{minHeight:'44px'}}>
 
         {/* Logo */}
-        <div className="flex items-center gap-1 select-none">
-          <span className="text-white font-semibold text-base tracking-tight">Politor</span>
-          <span className="font-semibold text-base bg-gradient-to-r from-brand-purple to-brand-energic-blue bg-clip-text text-transparent">
-            AI
-          </span>
-        </div>
+        <img src={logoSvg} alt="Politor AI" className="h-8 select-none self-center" />
 
         {/* Nav links + avatar */}
-        <nav className="flex items-center gap-6">
+        <nav className="flex items-stretch gap-6">
           <Link
             to="/chat"
-            className={`text-sm transition-colors ${
+            className={`text-sm transition-colors flex items-center ${
               location.pathname === '/chat'
-                ? 'text-white underline underline-offset-4'
+                ? 'text-white border-b-2 border-white'
                 : 'text-white/60 hover:text-white'
             }`}
           >
@@ -59,9 +55,9 @@ export default function TopNav() {
           {isAdmin && (
             <Link
               to="/"
-              className={`text-sm transition-colors ${
+              className={`text-sm transition-colors flex items-center ${
                 location.pathname === '/'
-                  ? 'text-white underline underline-offset-4'
+                  ? 'text-white border-b-2 border-white'
                   : 'text-white/60 hover:text-white'
               }`}
             >
@@ -69,13 +65,15 @@ export default function TopNav() {
             </Link>
           )}
 
-          <button
-            onClick={handleLogout}
-            title="Logout"
-            className="w-8 h-8 rounded-full bg-brand-purple/80 flex items-center justify-center text-white text-xs font-semibold hover:bg-brand-purple transition-colors"
-          >
-            {initials}
-          </button>
+          <div className="flex items-center">
+            <button
+              onClick={handleLogout}
+              title="Logout"
+              className="w-8 h-8 rounded-full bg-brand-purple/80 flex items-center justify-center text-white text-xs font-semibold hover:bg-brand-purple transition-colors ring-2 ring-brand-purple/60 ring-offset-2 ring-offset-brand-dark-blue shadow-[0_0_10px_rgba(206,147,219,0.55)]"
+            >
+              {initials}
+            </button>
+          </div>
         </nav>
 
       </header>
