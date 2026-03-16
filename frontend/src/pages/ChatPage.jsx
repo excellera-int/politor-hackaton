@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useMutation, gql } from '@apollo/client';
 import TopNav from '../components/TopNav';
-import Sidebar from '../components/Sidebar';
 
 const CHAT_MUTATION = gql`
   mutation Chat($message: String!, $conversation_history: [ChatMessageInput]) {
@@ -137,11 +136,10 @@ export default function ChatPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col">
+    <div className="min-h-screen bg-brand-light-blue flex flex-col">
       <TopNav />
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar />
-        <main className="flex-1 flex flex-col">
+        <main className="flex-1 flex flex-col bg-white mx-4 mb-4 rounded-2xl shadow-sm overflow-hidden">
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-3 border-b border-gray-200 bg-white">
             <h2 className="text-sm font-medium text-gray-700">Council of Ministers — AI Search</h2>
@@ -198,3 +196,4 @@ export default function ChatPage() {
     </div>
   );
 }
+
