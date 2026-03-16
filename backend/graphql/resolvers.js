@@ -1,72 +1,149 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const { query } = require('../config/db');
-const { testConnection: testNeo4j } = require('../config/graph');
+const { driver: neo4jDriver, testConnection: testNeo4j } = require('../config/graph');
 const { testConnection: testPostgres } = require('../config/db');
+const { tools: neo4jTools } = require('../mcp_tools/neo4j_tools');
 
 const anthropic = new Anthropic.default({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// System prompt: instructs Claude to ground every answer in source documents
-// and always cite session numbers and dates — Simone's non-negotiable requirement
-const SYSTEM_PROMPT = `You are Politor, an AI assistant specialised in analysing Italian Council of Ministers (Consiglio dei Ministri) sessions.
+const SYSTEM_PROMPT = `You are Politor, an AI assistant specialised in analysing Italian Council of Ministers (Consiglio dei Ministri) sessions stored in a Neo4j knowledge graph.
 
-You are given a set of official session records as context. Your task is to answer the user's question accurately and concisely, always grounding your response in the provided source documents.
+You have access to a set of tools that query the graph database directly. Use them to retrieve accurate, grounded information before answering.
 
 Rules:
-1. Always cite the session number and date when referencing a specific session (e.g. "Session #450, 12 March 2023").
-2. If the answer cannot be found in the provided context, say so clearly — do not hallucinate.
-3. Keep answers focused and structured. Use bullet points for multi-item answers.
-4. Respond in the same language the user uses.
-5. The context below represents the relevant sessions retrieved for this question.`;
+1. Always use the available tools to find relevant data — do not answer from memory alone.
+2. Always cite the session ID and date when referencing a specific session.
+3. If no relevant data is found via the tools, say so clearly — do not hallucinate.
+4. Keep answers focused and structured. Use bullet points for multi-item answers.
+5. Respond in the same language the user uses (Italian or English).
+6. When a question involves a person or ministry, use search_by_stakeholder or get_stakeholder_profile.
+7. When a question is about a policy topic, use search_by_issue or search_paragraphs.
+8. You may call multiple tools in sequence to build a complete answer.`;
 
 /**
- * Search sessions by keyword across the data and info JSONB fields.
- * Extracts keywords from the message and uses PostgreSQL full-text / ILIKE search.
+ * Group raw tool result rows by sessionId for the frontend right panel.
  */
-async function searchRelevantSessions(message) {
-  // Basic keyword extraction — split on whitespace, filter short words
-  const keywords = message
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
-    .slice(0, 5);
-
-  if (keywords.length === 0) {
-    // Fallback: return the most recent 5 sessions
-    const result = await query(
-      'SELECT * FROM sessions ORDER BY date DESC NULLS LAST LIMIT 5',
-      []
-    );
-    return result.rows;
+function buildSessionResults(rows) {
+  const sessionMap = new Map();
+  for (const row of rows) {
+    if (!row.sessionId) continue;
+    if (!sessionMap.has(row.sessionId)) {
+      sessionMap.set(row.sessionId, {
+        sessionId: row.sessionId,
+        sessionTitle: row.sessionTitle || row.mainTitle || '',
+        date: row.date || row.sessionDate || '',
+        url: row.url || '',
+        paragraphs: new Map(),
+      });
+    }
+    const session = sessionMap.get(row.sessionId);
+    const pid = row.paragraphId;
+    if (pid && !session.paragraphs.has(pid)) {
+      session.paragraphs.set(pid, {
+        paragraphId: pid,
+        title: row.title || row.paragraphTitle || '',
+        contentPreview: row.contentPreview || '',
+        issue: row.issue || '',
+        subIssue: row.subIssue || '',
+        issueCode: row.issueCode || row.code || '',
+        stakeholders: row.stakeholders ? JSON.stringify(row.stakeholders) : '',
+      });
+    }
   }
-
-  // Build ILIKE conditions across data and info TEXT fields
-  const conditions = keywords
-    .map((_, i) => `(data ILIKE $${i + 1} OR info ILIKE $${i + 1})`)
-    .join(' OR ');
-  const params = keywords.map((k) => `%${k}%`);
-
-  const result = await query(
-    `SELECT * FROM sessions WHERE ${conditions} ORDER BY date DESC NULLS LAST LIMIT 8`,
-    params
-  );
-  return result.rows;
+  return Array.from(sessionMap.values())
+    .sort((a, b) => (b.date > a.date ? 1 : -1))
+    .map((s) => ({ ...s, paragraphs: Array.from(s.paragraphs.values()) }));
 }
 
 /**
- * Format session rows as readable context for the AI prompt.
+ * Execute an MCP tool by name with the given input.
  */
-function formatSessionContext(sessions) {
-  if (sessions.length === 0) {
-    return 'No session records are currently available in the database. The data ingestion step has not been run yet.';
+async function executeTool(toolName, toolInput) {
+  const tool = neo4jTools.find((t) => t.name === toolName);
+  if (!tool) {
+    console.error(`[CHAT] Unknown tool requested: ${toolName}`);
+    return { error: `Unknown tool: ${toolName}` };
   }
-  return sessions
-    .map((s) => {
-      const date = s.date ? new Date(s.date).toLocaleDateString('en-GB') : 'unknown date';
-      const dataPreview = s.data ? s.data.slice(0, 400) : '(no data)';
-      return `--- Session #${s.number || s.id} | ${date} | Branch: ${s.branch || 'n/a'} | Type: ${s.type || 'n/a'} | Status: ${s.status || 'n/a'}\n${dataPreview}`;
-    })
-    .join('\n\n');
+  console.log(`[CHAT] → tool: ${toolName}`, JSON.stringify(toolInput));
+  try {
+    const result = await tool.handler(toolInput, neo4jDriver);
+    console.log(`[CHAT] ← tool: ${toolName} returned ${Array.isArray(result) ? result.length + ' rows' : 'object'}`);
+    return result;
+  } catch (err) {
+    console.error(`[CHAT] tool error (${toolName}):`, err.message);
+    return { error: err.message };
+  }
+}
+
+/**
+ * Agentic loop: call Claude, execute tool calls, feed results back, repeat
+ * until Claude produces a final text response (stop_reason === 'end_turn').
+ */
+async function agenticChat(userMessage, conversationHistory) {
+  const toolDefs = neo4jTools.map(({ name, description, input_schema }) => ({
+    name,
+    description,
+    input_schema,
+  }));
+
+  // Build message list from conversation history + new user message
+  const messages = [
+    ...(conversationHistory || []).map((m) => ({ role: m.role, content: m.content })),
+    { role: 'user', content: userMessage },
+  ];
+
+  const toolsUsed = [];
+  const allToolResults = []; // collect raw rows from every tool call
+  const MAX_ITERATIONS = 8;
+
+  console.log(`[CHAT] New request: "${userMessage.slice(0, 80)}..."`);
+
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    console.log(`[CHAT] Iteration ${i + 1} — calling Claude (${messages.length} messages in context)`);
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      tools: toolDefs,
+      messages,
+    });
+
+    // Append assistant message to history
+    messages.push({ role: 'assistant', content: response.content });
+
+    console.log(`[CHAT] stop_reason: ${response.stop_reason}`);
+
+    if (response.stop_reason === 'end_turn') {
+      const textBlock = response.content.find((b) => b.type === 'text');
+      console.log(`[CHAT] Done. Tools used: ${toolsUsed.map(t => t.tool).join(', ') || 'none'}`);
+      return { message: textBlock ? textBlock.text : '', toolsUsed, sessionResults: buildSessionResults(allToolResults) };
+    }
+
+    if (response.stop_reason === 'tool_use') {
+      // Execute all tool calls in parallel
+      const toolBlocks = response.content.filter((b) => b.type === 'tool_use');
+      const results = await Promise.all(
+        toolBlocks.map(async (block) => {
+          const result = await executeTool(block.name, block.input);
+          toolsUsed.push({ tool: block.name, input: block.input });
+          // Collect rows that have a sessionId for the right panel
+          const rows = Array.isArray(result) ? result : result.activity || [];
+          rows.forEach((row) => { if (row.sessionId) allToolResults.push(row); });
+          return { type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) };
+        })
+      );
+      messages.push({ role: 'user', content: results });
+      continue;
+    }
+
+    // max_tokens or other stop reason — return whatever text we have
+    const textBlock = response.content.find((b) => b.type === 'text');
+    return { message: textBlock ? textBlock.text : '(no response)', toolsUsed, sessionResults: buildSessionResults(allToolResults) };
+  }
+
+  return { message: 'Reached maximum tool-call iterations without a final answer.', toolsUsed, sessionResults: buildSessionResults(allToolResults) };
 }
 
 const resolvers = {
@@ -193,43 +270,13 @@ const resolvers = {
     },
 
     chat: async (_parent, { message, conversation_history = [] }) => {
-      // 1. Retrieve relevant sessions from PostgreSQL
-      const sessions = await searchRelevantSessions(message);
-
-      // 2. Format sessions as grounded context for the AI
-      const contextBlock = formatSessionContext(sessions);
-
-      // 3. Build message history for multi-turn conversation
-      const history = (conversation_history || []).map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
-
-      // 4. Compose the user message with injected context
-      const userMessageWithContext = `Context — relevant Council of Ministers sessions:\n\n${contextBlock}\n\n---\n\nUser question: ${message}`;
-
-      const messages = [
-        ...history,
-        { role: 'user', content: userMessageWithContext },
-      ];
-
-      // 5. Call Anthropic Claude
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages,
-      });
-
-      const aiMessage = response.content[0].text;
-
-      // 6. Return AI response with the source sessions used
-      const contextUsed = sessions.map((row) => ({ ...row, id: String(row.id) }));
-
-      return {
-        message: aiMessage,
-        context_used: contextUsed,
-      };
+      try {
+        const { message: aiMessage, sessionResults } = await agenticChat(message, conversation_history);
+        return { message: aiMessage, context_used: [], sessions: sessionResults || [] };
+      } catch (err) {
+        console.error('[CHAT] Fatal error:', err.message);
+        throw err;
+      }
     },
   },
 };

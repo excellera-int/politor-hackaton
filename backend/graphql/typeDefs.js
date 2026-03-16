@@ -32,9 +32,28 @@ const typeDefs = `
     timestamp: String!
   }
 
+  type ParagraphResult {
+    paragraphId:    String
+    title:          String
+    contentPreview: String
+    issue:          String
+    subIssue:       String
+    issueCode:      String
+    stakeholders:   String
+  }
+
+  type SessionResult {
+    sessionId:    String!
+    sessionTitle: String
+    date:         String
+    url:          String
+    paragraphs:   [ParagraphResult!]!
+  }
+
   type ChatResponse {
     message:      String!
     context_used: [Session!]!
+    sessions:     [SessionResult!]!
   }
 
   type Query {

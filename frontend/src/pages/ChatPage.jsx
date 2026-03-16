@@ -7,17 +7,70 @@ const CHAT_MUTATION = gql`
   mutation Chat($message: String!, $conversation_history: [ChatMessageInput]) {
     chat(message: $message, conversation_history: $conversation_history) {
       message
-      context_used {
-        id
-        number
-        branch
-        type
-        status
+      sessions {
+        sessionId
+        sessionTitle
         date
+        url
+        paragraphs {
+          paragraphId
+          title
+          contentPreview
+          issue
+          subIssue
+          issueCode
+          stakeholders
+        }
       }
     }
   }
 `;
+
+function renderInline(text) {
+  // **bold** and *italic*
+  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+  return parts.map((p, i) => {
+    if (p.startsWith('**') && p.endsWith('**'))
+      return <strong key={i}>{p.slice(2, -2)}</strong>;
+    if (p.startsWith('*') && p.endsWith('*'))
+      return <em key={i}>{p.slice(1, -1)}</em>;
+    return p;
+  });
+}
+
+function MarkdownMessage({ content }) {
+  const lines = content.split('\n');
+  const elements = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (/^### /.test(line)) {
+      elements.push(<h3 key={i} className="font-semibold text-brand-dark-blue text-sm mt-3 mb-1">{renderInline(line.slice(4))}</h3>);
+    } else if (/^## /.test(line)) {
+      elements.push(<h2 key={i} className="font-bold text-brand-dark-blue text-sm mt-4 mb-1.5">{renderInline(line.slice(3))}</h2>);
+    } else if (/^# /.test(line)) {
+      elements.push(<h1 key={i} className="font-bold text-brand-dark-blue text-base mt-4 mb-2">{renderInline(line.slice(2))}</h1>);
+    } else if (/^[-*] /.test(line)) {
+      // Collect consecutive list items
+      const items = [];
+      while (i < lines.length && /^[-*] /.test(lines[i])) {
+        items.push(<li key={i} className="ml-4 list-disc">{renderInline(lines[i].slice(2))}</li>);
+        i++;
+      }
+      elements.push(<ul key={`ul-${i}`} className="my-1 space-y-0.5">{items}</ul>);
+      continue;
+    } else if (line.trim() === '') {
+      elements.push(<div key={i} className="h-1.5" />);
+    } else {
+      elements.push(<p key={i} className="leading-relaxed">{renderInline(line)}</p>);
+    }
+    i++;
+  }
+
+  return <div className="space-y-0.5">{elements}</div>;
+}
 
 function formatTime(date) {
   if (!date) return '';
@@ -48,8 +101,8 @@ function UserBubble({ message }) {
 function AssistantBubble({ message }) {
   return (
     <div className="flex flex-col items-start gap-1">
-      <div className="text-sm text-gray-700 max-w-[92%] leading-relaxed">
-        {message.content}
+      <div className="text-sm text-gray-700 max-w-[92%]">
+        <MarkdownMessage content={message.content} />
         <span
           className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-brand-dark-blue text-white ml-1.5 align-middle cursor-default flex-shrink-0"
           style={{ fontSize: '9px' }}
@@ -63,36 +116,82 @@ function AssistantBubble({ message }) {
   );
 }
 
-function SourceCard({ source, index }) {
+function ParagraphCard({ para }) {
+  const [expanded, setExpanded] = React.useState(false);
   return (
-    <div className="border border-gray-100 rounded-xl overflow-hidden">
-      <div className="flex items-center gap-3 px-5 py-3 border-b border-gray-100 bg-gray-50/60">
-        <span className="bg-brand-dark-blue text-white text-xs font-semibold px-2.5 py-0.5 rounded-full font-funnel tracking-wide">
-          SOURCE {index + 1}
-        </span>
-        <span className="text-sm font-medium text-gray-700 truncate">
-          Session #{source.number || source.id}
-          {source.branch ? ` — ${source.branch}` : ''}
-          {source.type ? ` / ${source.type}` : ''}
-        </span>
+    <div className="border border-gray-100 rounded-lg overflow-hidden">
+      <button
+        className="w-full flex items-start justify-between gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold text-brand-dark-blue leading-snug">{para.title}</p>
+          {para.issue && (
+            <p className="text-[11px] text-gray-400 mt-0.5">
+              {para.issueCode && <span className="font-mono mr-1">{para.issueCode}</span>}
+              {para.issue}{para.subIssue ? ` › ${para.subIssue}` : ''}
+            </p>
+          )}
+        </div>
+        <span className="text-gray-400 text-xs mt-0.5 flex-shrink-0">{expanded ? '▲' : '▼'}</span>
+      </button>
+      {expanded && (
+        <div className="px-4 pb-3 border-t border-gray-50 space-y-2">
+          {para.contentPreview && (
+            <p className="text-xs text-gray-600 leading-relaxed pt-2">{para.contentPreview}</p>
+          )}
+          {para.stakeholders && (() => {
+            try {
+              const shs = JSON.parse(para.stakeholders).filter(s => s.name);
+              if (!shs.length) return null;
+              return (
+                <div className="flex flex-wrap gap-1 pt-1">
+                  {shs.map((s, i) => (
+                    <span key={i} className="text-[10px] bg-brand-purple/10 text-brand-dark-blue px-2 py-0.5 rounded-full">
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
+              );
+            } catch { return null; }
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SessionCard({ session, index }) {
+  const date = session.date
+    ? new Date(session.date).toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' })
+    : '';
+  // Extract session number from title like "Comunicato stampa del Consiglio dei Ministri n. 163"
+  const numMatch = session.sessionTitle?.match(/n\.\s*(\d+)/);
+  const sessionNum = numMatch ? numMatch[1] : session.sessionId;
+
+  return (
+    <div className="border border-gray-200 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between gap-3 px-5 py-3 bg-gray-50 border-b border-gray-200">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="bg-brand-dark-blue text-white text-[10px] font-semibold px-2 py-0.5 rounded-full font-funnel tracking-wide flex-shrink-0">
+              CdM #{sessionNum}
+            </span>
+            {date && <span className="text-xs text-gray-500">{date}</span>}
+          </div>
+        </div>
+        {session.url && (
+          <a href={session.url} target="_blank" rel="noopener noreferrer"
+            className="text-[10px] text-brand-energic-blue underline flex-shrink-0">
+            fonte ↗
+          </a>
+        )}
       </div>
-      <div className="px-5 py-4">
-        <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-widest mb-2">
-          Document Extract: {source.type || 'N/A'}
-        </p>
-        <p className="text-sm text-gray-600 leading-relaxed">
-          {source.status || 'No extract available.'}
-        </p>
-        {source.date && (
-          <p className="text-xs text-gray-400 mt-3">
-            Published:{' '}
-            {new Date(source.date).toLocaleDateString('en-GB', {
-              day: '2-digit',
-              month: 'long',
-              year: 'numeric',
-            })}
-            {source.branch && <span className="ml-2">· {source.branch}</span>}
-          </p>
+      <div className="px-4 py-3 space-y-2">
+        {session.paragraphs.length === 0 ? (
+          <p className="text-xs text-gray-400">Nessun paragrafo disponibile.</p>
+        ) : (
+          session.paragraphs.map((p) => <ParagraphCard key={p.paragraphId} para={p} />)
         )}
       </div>
     </div>
@@ -135,7 +234,7 @@ export default function ChatPage() {
         time: new Date(),
       };
       setMessages((prev) => [...prev, aiMessage]);
-      setRightPanel({ analysis: data.chat.message, sources: data.chat.context_used });
+      setRightPanel({ analysis: data.chat.message, sessions: data.chat.sessions || [] });
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -237,22 +336,17 @@ export default function ChatPage() {
               </div>
             ) : (
               <div className="space-y-5">
-                {/* AI Analysis block */}
-                <div>
-                  <p className="text-[11px] font-semibold tracking-widest text-brand-energic-blue uppercase mb-3">
-                    AI Analysis: Policy Implications
-                  </p>
-                  <div className="bg-gray-50 rounded-xl px-5 py-4 text-sm text-gray-700 leading-relaxed">
-                    {rightPanel.analysis}
-                  </div>
-                </div>
-
-                {/* Source cards */}
-                {rightPanel.sources && rightPanel.sources.length > 0 && (
-                  <div className="space-y-3">
-                    {rightPanel.sources.map((s, i) => (
-                      <SourceCard key={s.id} source={s} index={i} />
-                    ))}
+                {/* Session cards */}
+                {rightPanel.sessions && rightPanel.sessions.length > 0 && (
+                  <div>
+                    <p className="text-[11px] font-semibold tracking-widest text-gray-400 uppercase mb-3">
+                      Sessioni rilevanti ({rightPanel.sessions.length})
+                    </p>
+                    <div className="space-y-3">
+                      {rightPanel.sessions.map((s, i) => (
+                        <SessionCard key={s.sessionId} session={s} index={i} />
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
