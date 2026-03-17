@@ -1,25 +1,24 @@
 /**
  * Neo4j MCP Tools — Politor
  *
- * Dataset: 41 CdM sessions, 330 paragraphs, 294 stakeholders, 45 issues, 8 industries.
- * All sessions are Italian Council of Ministers (Consiglio dei Ministri) press releases.
+ * Each tool has:
+ *   - name, description, input_schema  → sent to Claude as tool definitions
+ *   - handler(input, driver)           → executes Cypher, returns rows
+ *   - retrieval: true/false            → true = results shown in right panel
+ *                                        false = discovery only (list/count tools)
  *
- * Graph schema:
- *   (Session)-[:HAS_PARAGRAPH]->(Paragraph)-[:ABOUT]->(Issue)
- *   (Paragraph)-[:INVOLVES_INDUSTRY]->(Industry)
- *   (Paragraph)-[r:MENTIONS]->(Stakeholder)
- *     r.mentionType: proposer | responsible_ministry | cited_institution | co_signer | named_person
- *     r.role: institutional role text
- *     r.mentionContent: verbatim excerpt
+ * Dataset: 41 CdM sessions (2025-2026), 330 paragraphs, 294 stakeholders, 45 issues, 8 industries.
+ * Date format in DB: "2026-02-26 11:37:00" — string comparison works for range filtering.
  *
- * Stakeholder types: person (83) | institution (141) | ministry (38) | company (14) | eu_body (9) | association (9)
- * Industries (English labels): Finance | Energy & Utilities | Infrastructure & Transportation |
- *   Manufacturing & Industrial Production | Healthcare | Technology, Media & Telecommunications |
- *   Professional Services & Education / Culture | Consumer Goods & Retail
+ * Stakeholder types: person | institution | ministry | company | eu_body | association
+ * mentionType:       proposer | responsible_ministry | co_signer | cited_institution | named_person
+ * Industries:        Finance | Energy & Utilities | Infrastructure & Transportation |
+ *                    Manufacturing & Industrial Production | Healthcare |
+ *                    Technology, Media & Telecommunications |
+ *                    Professional Services & Education / Culture | Consumer Goods & Retail
  */
 
 async function cypher(driver, query, params = {}) {
-  // Neo4j requires integer literals for LIMIT/SKIP — coerce all JS numbers to integers
   const safeParams = {};
   for (const [k, v] of Object.entries(params)) {
     safeParams[k] = typeof v === 'number' ? Math.floor(v) : v;
@@ -43,33 +42,43 @@ async function cypher(driver, query, params = {}) {
   }
 }
 
-// ─── Tool definitions ────────────────────────────────────────────────────────
+/** Build a Cypher WHERE clause for optional date range filtering on p.date */
+function dateFilter(dateFrom, dateTo, prefix = 'AND') {
+  const clauses = [];
+  if (dateFrom) clauses.push(`p.date >= $dateFrom`);
+  if (dateTo)   clauses.push(`p.date <= $dateTo`);
+  return clauses.length ? `${prefix} ${clauses.join(' AND ')}` : '';
+}
+
+// ─── Tools ───────────────────────────────────────────────────────────────────
 
 const tools = [
-  // ── 1. Full-text search on paragraph title + content ─────────────────────
+
+  // ── 1. Full-text paragraph search (RETRIEVAL) ────────────────────────────
   {
     name: 'search_paragraphs',
+    retrieval: true,
     description:
-      'Search Council of Ministers paragraphs by keyword in title or content. ' +
-      'Returns matching paragraphs with session, issue classification, and involved stakeholders. ' +
-      'Use this as the primary tool for topic or law searches (e.g. "decreto fiscale", "immigrazione", "PNRR").',
+      'Search paragraphs by keyword in title or content. Returns paragraphs with session metadata, ' +
+      'issue classification, and stakeholders. ' +
+      'Accepts optional date_from / date_to (YYYY-MM-DD) to restrict to a time period. ' +
+      'ALWAYS use date filters when the question specifies a month, year, or period.',
     input_schema: {
       type: 'object',
       properties: {
-        keyword: {
-          type: 'string',
-          description: 'Keyword or phrase to search (Italian preferred, case-insensitive)',
-        },
-        limit: { type: 'integer', description: 'Max results (default 8, max 20)' },
+        keyword:   { type: 'string',  description: 'Keyword or phrase (Italian preferred)' },
+        date_from: { type: 'string',  description: 'Start date inclusive (YYYY-MM-DD)' },
+        date_to:   { type: 'string',  description: 'End date inclusive (YYYY-MM-DD)' },
+        limit:     { type: 'integer', description: 'Max results (default 8, max 20)' },
       },
       required: ['keyword'],
     },
-    handler: async ({ keyword, limit = 8 }, driver) => {
-      return cypher(
-        driver,
+    handler: async ({ keyword, date_from, date_to, limit = 8 }, driver) => {
+      return cypher(driver,
         `CALL db.index.fulltext.queryNodes('paragraph_fulltext', $kw)
          YIELD node AS p, score
          MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
+         WHERE 1=1 ${dateFilter(date_from, date_to)}
          OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
          OPTIONAL MATCH (p)-[r:MENTIONS]->(st:Stakeholder)
          WITH s, p, i, score, collect(DISTINCT {name: st.name, role: r.role, mentionType: r.mentionType}) AS stakeholders
@@ -88,46 +97,39 @@ const tools = [
            score
          ORDER BY score DESC
          LIMIT toInteger($limit)`,
-        { kw: keyword, limit: Math.min(limit, 20) }
+        { kw: keyword, dateFrom: date_from || '', dateTo: date_to || '', limit: Math.min(limit, 20) }
       );
     },
   },
 
-  // ── 2. Find all mentions of a stakeholder ────────────────────────────────
+  // ── 2. Search by stakeholder (RETRIEVAL) ─────────────────────────────────
   {
     name: 'search_by_stakeholder',
+    retrieval: true,
     description:
-      'Find all paragraphs and sessions that mention a specific person, ministry, or institution. ' +
-      'Shows their role, mention type (proposer/co_signer/cited_institution/named_person/responsible_ministry), ' +
-      'and the policy issue discussed. ' +
-      'Use this when asked about a specific minister (e.g. "Giorgetti", "Piantedosi", "Meloni"), ' +
+      'Find all paragraphs that mention a specific person, ministry, or institution. ' +
+      'Shows their role and mention type in each act. ' +
+      'Accepts optional date_from / date_to (YYYY-MM-DD). ' +
+      'Use when asked about a minister (e.g. "Giorgetti", "Meloni", "Piantedosi"), ' +
       'ministry, or institution (e.g. "CONSOB", "Banca d\'Italia").',
     input_schema: {
       type: 'object',
       properties: {
-        name: {
-          type: 'string',
-          description: 'Full or partial name of the person, ministry, or institution',
-        },
-        mention_type: {
-          type: 'string',
-          description:
-            'Optional filter by role in the act: proposer | responsible_ministry | co_signer | cited_institution | named_person',
-        },
-        limit: { type: 'integer', description: 'Max results (default 12)' },
+        name:         { type: 'string',  description: 'Full or partial name' },
+        mention_type: { type: 'string',  description: 'proposer | responsible_ministry | co_signer | cited_institution | named_person' },
+        date_from:    { type: 'string',  description: 'Start date inclusive (YYYY-MM-DD)' },
+        date_to:      { type: 'string',  description: 'End date inclusive (YYYY-MM-DD)' },
+        limit:        { type: 'integer', description: 'Max results (default 12)' },
       },
       required: ['name'],
     },
-    handler: async ({ name, mention_type, limit = 12 }, driver) => {
-      const mentionFilter = mention_type
-        ? 'AND toLower(r.mentionType) = toLower($mentionType)'
-        : '';
-      return cypher(
-        driver,
+    handler: async ({ name, mention_type, date_from, date_to, limit = 12 }, driver) => {
+      const mentionFilter = mention_type ? 'AND toLower(r.mentionType) = toLower($mentionType)' : '';
+      return cypher(driver,
         `CALL db.index.fulltext.queryNodes('stakeholder_fulltext', $name)
          YIELD node AS st
          MATCH (p:Paragraph)-[r:MENTIONS]->(st)
-         WHERE 1=1 ${mentionFilter}
+         WHERE 1=1 ${mentionFilter} ${dateFilter(date_from, date_to)}
          MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
          OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
          RETURN
@@ -135,6 +137,7 @@ const tools = [
            st.type       AS stakeholderType,
            r.role        AS role,
            r.mentionType AS mentionType,
+           p.paragraphId AS paragraphId,
            p.title       AS paragraphTitle,
            p.date        AS date,
            s.sessionId   AS sessionId,
@@ -145,56 +148,43 @@ const tools = [
            i.code        AS issueCode
          ORDER BY p.date DESC
          LIMIT toInteger($limit)`,
-        { name, mentionType: mention_type || '', limit: Math.min(limit, 30) }
+        { name, mentionType: mention_type || '', dateFrom: date_from || '', dateTo: date_to || '', limit: Math.min(limit, 30) }
       );
     },
   },
 
-  // ── 3. Full stakeholder profile ───────────────────────────────────────────
+  // ── 3. Stakeholder full profile (RETRIEVAL) ───────────────────────────────
   {
     name: 'get_stakeholder_profile',
+    retrieval: true,
     description:
-      'Get a comprehensive profile of a stakeholder: all sessions they appear in, ' +
-      'their roles, the policy issues they are linked to, and who they are most often cited alongside. ' +
-      'Use when the user wants a complete picture of a minister or institution\'s activity ' +
-      '(e.g. "cosa ha fatto Musumeci?", "quali temi ha trattato il MEF?").',
+      'Get a full profile: all sessions, roles, policy issues, and co-cited stakeholders for a person or institution. ' +
+      'Use when the user wants a complete picture of a minister or institution\'s activity.',
     input_schema: {
       type: 'object',
       properties: {
-        name: {
-          type: 'string',
-          description: 'Full or partial name of the stakeholder',
-        },
+        name: { type: 'string', description: 'Full or partial name of the stakeholder' },
       },
       required: ['name'],
     },
     handler: async ({ name }, driver) => {
       const [activity, coStakeholders, issues] = await Promise.all([
-        cypher(
-          driver,
+        cypher(driver,
           `CALL db.index.fulltext.queryNodes('stakeholder_fulltext', $name)
            YIELD node AS st
            MATCH (p:Paragraph)-[r:MENTIONS]->(st)
            MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
            OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
            RETURN
-             st.name       AS stakeholder,
-             st.type       AS type,
-             r.mentionType AS mentionType,
-             r.role        AS role,
-             p.title       AS paragraphTitle,
-             p.date        AS date,
-             s.sessionId   AS sessionId,
-             s.mainTitle   AS sessionTitle,
-             s.url         AS url,
-             i.issue       AS issue,
-             i.subIssue    AS subIssue,
-             i.code        AS issueCode
+             st.name AS stakeholder, st.type AS type,
+             r.mentionType AS mentionType, r.role AS role,
+             p.paragraphId AS paragraphId, p.title AS paragraphTitle, p.date AS date,
+             s.sessionId AS sessionId, s.mainTitle AS sessionTitle, s.url AS url,
+             i.issue AS issue, i.subIssue AS subIssue, i.code AS issueCode
            ORDER BY p.date DESC`,
           { name }
         ),
-        cypher(
-          driver,
+        cypher(driver,
           `CALL db.index.fulltext.queryNodes('stakeholder_fulltext', $name)
            YIELD node AS st
            MATCH (p:Paragraph)-[:MENTIONS]->(st)
@@ -204,8 +194,7 @@ const tools = [
            ORDER BY coOccurrences DESC LIMIT 10`,
           { name }
         ),
-        cypher(
-          driver,
+        cypher(driver,
           `CALL db.index.fulltext.queryNodes('stakeholder_fulltext', $name)
            YIELD node AS st
            MATCH (p:Paragraph)-[:MENTIONS]->(st)
@@ -219,131 +208,188 @@ const tools = [
     },
   },
 
-  // ── 4. Search by policy issue / sub-issue ─────────────────────────────────
+  // ── 4. Search by policy issue (RETRIEVAL) ────────────────────────────────
   {
     name: 'search_by_issue',
+    retrieval: true,
     description:
-      'Find paragraphs classified under a specific policy issue or sub-issue from the taxonomy. ' +
+      'Find paragraphs classified under a policy issue or sub-issue. ' +
       'Macro-areas: Economia & finanza pubblica | Energia & ambiente | Protezione civile & emergenze | ' +
       'Lavoro & politiche sociali | Infrastrutture & territorio | Sicurezza & giustizia | ' +
       'Immigrazione | Affari europei & internazionali | Salute & istruzione | Pubblica amministrazione. ' +
-      'Also accepts issue codes like "6.2" or "8.2". ' +
-      'Use when the user asks about a policy area or legislative topic.',
+      'Also accepts issue codes (e.g. "2.1", "6.2"). ' +
+      'Accepts optional date_from / date_to (YYYY-MM-DD). ' +
+      'ALWAYS use date filters when the question specifies a time period.',
     input_schema: {
       type: 'object',
       properties: {
-        issue: {
-          type: 'string',
-          description: 'Macro-area name, sub-issue name, or code (e.g. "giustizia", "6.2", "PNRR")',
-        },
-        limit: { type: 'integer', description: 'Max results (default 10)' },
+        issue:     { type: 'string',  description: 'Macro-area, sub-issue name, or code (e.g. "Energia", "2.1")' },
+        date_from: { type: 'string',  description: 'Start date inclusive (YYYY-MM-DD)' },
+        date_to:   { type: 'string',  description: 'End date inclusive (YYYY-MM-DD)' },
+        limit:     { type: 'integer', description: 'Max results (default 10)' },
       },
       required: ['issue'],
     },
-    handler: async ({ issue, limit = 10 }, driver) => {
-      return cypher(
-        driver,
+    handler: async ({ issue, date_from, date_to, limit = 10 }, driver) => {
+      return cypher(driver,
         `CALL db.index.fulltext.queryNodes('issue_fulltext', $issue)
          YIELD node AS i
          MATCH (p:Paragraph)-[:ABOUT]->(i)
          MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
+         WHERE 1=1 ${dateFilter(date_from, date_to)}
          OPTIONAL MATCH (p)-[r:MENTIONS]->(st:Stakeholder)
          WITH s, p, i, collect(DISTINCT {name: st.name, role: r.role, mentionType: r.mentionType}) AS stakeholders
          RETURN
-           i.issue                      AS issue,
-           i.subIssue                   AS subIssue,
-           i.code                       AS code,
+           i.issue AS issue, i.subIssue AS subIssue, i.code AS code,
            p.paragraphId                AS paragraphId,
            p.title                      AS title,
            p.date                       AS date,
            s.sessionId                  AS sessionId,
            s.mainTitle                  AS sessionTitle,
            s.url                        AS url,
-           substring(p.content, 0, 500) AS contentPreview,
+           substring(p.content, 0, 400) AS contentPreview,
            stakeholders
          ORDER BY p.date DESC
          LIMIT toInteger($limit)`,
-        { issue, limit: Math.min(limit, 20) }
+        { issue, dateFrom: date_from || '', dateTo: date_to || '', limit: Math.min(limit, 20) }
       );
     },
   },
 
-  // ── 5. Get all paragraphs of a session ────────────────────────────────────
+  // ── 5. Get session paragraphs (RETRIEVAL) ────────────────────────────────
   {
     name: 'get_session_paragraphs',
+    retrieval: true,
     description:
-      'Get the full agenda (all paragraphs) of a specific Council of Ministers session. ' +
-      'Accepts the session number as it appears in the press release title (e.g. "163") ' +
-      'OR the internal session ID (e.g. "2307"). ' +
-      'Use when the user asks what was decided in a specific meeting.',
+      'Get the full agenda of a specific Council of Ministers session. ' +
+      'Accepts the official session number (e.g. "163") or the internal session ID (e.g. "2307"). ' +
+      'Use AFTER list_sessions to get the full content of a specific meeting.',
     input_schema: {
       type: 'object',
       properties: {
-        session_number: {
-          type: 'string',
-          description: 'Official session number from the press release title (e.g. "163")',
-        },
-        session_id: {
-          type: 'string',
-          description: 'Internal session ID (e.g. "2307") — alternative to session_number',
-        },
+        session_number: { type: 'string', description: 'Official session number from the press release title (e.g. "163")' },
+        session_id:     { type: 'string', description: 'Internal session ID (e.g. "2307")' },
       },
     },
     handler: async ({ session_number, session_id }, driver) => {
-      // Support lookup by official number (embedded in mainTitle) or by internal ID
       const matchClause = session_id
         ? 'MATCH (s:Session {sessionId: $sessionId})'
         : 'MATCH (s:Session) WHERE s.mainTitle CONTAINS $sessionNumber';
       const params = session_id
         ? { sessionId: session_id }
         : { sessionNumber: `n. ${session_number}` };
-
-      return cypher(
-        driver,
+      return cypher(driver,
         `${matchClause}
          MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
          OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
          OPTIONAL MATCH (p)-[r:MENTIONS]->(st:Stakeholder)
          WITH s, p, i, collect(DISTINCT {name: st.name, role: r.role, mentionType: r.mentionType}) AS stakeholders
          RETURN
-           s.sessionId                  AS sessionId,
-           s.mainTitle                  AS sessionTitle,
-           s.date                       AS sessionDate,
-           s.url                        AS url,
+           s.sessionId AS sessionId, s.mainTitle AS sessionTitle, s.date AS date, s.url AS url,
            p.paragraphId                AS paragraphId,
            p.title                      AS title,
-           i.issue                      AS issue,
-           i.subIssue                   AS subIssue,
-           i.code                       AS issueCode,
-           stakeholders,
-           substring(p.content, 0, 400) AS contentPreview
+           i.issue AS issue, i.subIssue AS subIssue, i.code AS issueCode,
+           substring(p.content, 0, 400) AS contentPreview,
+           stakeholders
          ORDER BY p.paragraphId`,
         params
       );
     },
   },
 
-  // ── 6. Most active stakeholders ranking ───────────────────────────────────
+  // ── 6. Search by industry (RETRIEVAL) ────────────────────────────────────
   {
-    name: 'list_stakeholders',
+    name: 'search_by_industry',
+    retrieval: true,
     description:
-      'List stakeholders ranked by number of mentions, optionally filtered by type or mention role. ' +
-      'Types: person | ministry | institution | company | eu_body | association. ' +
-      'Mention roles: proposer | responsible_ministry | co_signer | cited_institution | named_person. ' +
-      'Use for ranking questions like "chi ha proposto più decreti?", "quali ministeri sono più attivi?", ' +
-      '"chi compare più spesso?".',
+      'Find paragraphs that impact a specific economic sector. ' +
+      'Industries: Finance | Energy & Utilities | Infrastructure & Transportation | ' +
+      'Manufacturing & Industrial Production | Healthcare | ' +
+      'Technology, Media & Telecommunications | ' +
+      'Professional Services & Education / Culture | Consumer Goods & Retail. ' +
+      'Accepts optional date_from / date_to (YYYY-MM-DD).',
     input_schema: {
       type: 'object',
       properties: {
-        type: {
-          type: 'string',
-          description: 'Filter by stakeholder type: person | ministry | institution | company | eu_body | association',
-        },
-        mention_type: {
-          type: 'string',
-          description: 'Filter by mention role: proposer | responsible_ministry | co_signer | cited_institution | named_person',
-        },
-        limit: { type: 'integer', description: 'Max results (default 20)' },
+        industry:  { type: 'string',  description: 'Industry name or keyword (e.g. "Energy", "Finance", "Healthcare")' },
+        date_from: { type: 'string',  description: 'Start date inclusive (YYYY-MM-DD)' },
+        date_to:   { type: 'string',  description: 'End date inclusive (YYYY-MM-DD)' },
+        limit:     { type: 'integer', description: 'Max results (default 10)' },
+      },
+      required: ['industry'],
+    },
+    handler: async ({ industry, date_from, date_to, limit = 10 }, driver) => {
+      return cypher(driver,
+        `MATCH (ind:Industry)
+         WHERE toLower(ind.name) CONTAINS toLower($industry)
+         MATCH (p:Paragraph)-[:INVOLVES_INDUSTRY]->(ind)
+         MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
+         WHERE 1=1 ${dateFilter(date_from, date_to)}
+         OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
+         OPTIONAL MATCH (p)-[r:MENTIONS]->(st:Stakeholder)
+         WITH ind, s, p, i, collect(DISTINCT {name: st.name, role: r.role, mentionType: r.mentionType}) AS stakeholders
+         RETURN
+           ind.name AS industry,
+           p.paragraphId AS paragraphId, p.title AS title, p.date AS date,
+           s.sessionId AS sessionId, s.mainTitle AS sessionTitle, s.url AS url,
+           i.issue AS issue, i.subIssue AS subIssue,
+           substring(p.content, 0, 400) AS contentPreview,
+           stakeholders
+         ORDER BY p.date DESC
+         LIMIT toInteger($limit)`,
+        { industry, dateFrom: date_from || '', dateTo: date_to || '', limit: Math.min(limit, 20) }
+      );
+    },
+  },
+
+  // ── 7. List sessions — DISCOVERY (not shown in right panel) ──────────────
+  {
+    name: 'list_sessions',
+    retrieval: false,
+    description:
+      'List Council of Ministers sessions with dates and official numbers. ' +
+      'Accepts optional date_from / date_to (YYYY-MM-DD) to restrict the listing. ' +
+      'Use to discover session IDs before calling get_session_paragraphs, ' +
+      'or to answer questions like "how many sessions in January?".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_from: { type: 'string',  description: 'Start date inclusive (YYYY-MM-DD)' },
+        date_to:   { type: 'string',  description: 'End date inclusive (YYYY-MM-DD)' },
+        limit:     { type: 'integer', description: 'Max results (default 10)' },
+      },
+    },
+    handler: async ({ date_from, date_to, limit = 10 }, driver) => {
+      const where = (date_from || date_to)
+        ? `WHERE ${[date_from && 's.date >= $dateFrom', date_to && 's.date <= $dateTo'].filter(Boolean).join(' AND ')}`
+        : '';
+      return cypher(driver,
+        `MATCH (s:Session)
+         ${where}
+         OPTIONAL MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
+         WITH s, count(p) AS paragraphs
+         RETURN s.sessionId AS sessionId, s.mainTitle AS title, s.date AS date, s.url AS url, paragraphs
+         ORDER BY s.date DESC
+         LIMIT toInteger($limit)`,
+        { dateFrom: date_from || '', dateTo: date_to || '', limit: Math.min(limit, 41) }
+      );
+    },
+  },
+
+  // ── 8. List stakeholders ranking — DISCOVERY ──────────────────────────────
+  {
+    name: 'list_stakeholders',
+    retrieval: false,
+    description:
+      'List stakeholders ranked by mentions. Useful for ranking questions: ' +
+      '"chi ha proposto più decreti?", "quali ministeri sono più attivi?". ' +
+      'Filter by type (person|ministry|institution) or mention_type (proposer|co_signer|...).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        type:         { type: 'string',  description: 'person | ministry | institution | company | eu_body | association' },
+        mention_type: { type: 'string',  description: 'proposer | responsible_ministry | co_signer | cited_institution | named_person' },
+        limit:        { type: 'integer', description: 'Max results (default 20)' },
       },
     },
     handler: async ({ type, mention_type, limit = 20 }, driver) => {
@@ -351,17 +397,10 @@ const tools = [
       if (type) conditions.push('toLower(st.type) = toLower($type)');
       if (mention_type) conditions.push('toLower(r.mentionType) = toLower($mentionType)');
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-
-      return cypher(
-        driver,
+      return cypher(driver,
         `MATCH (st:Stakeholder)<-[r:MENTIONS]-(p:Paragraph)
          ${where}
-         RETURN
-           st.name     AS name,
-           st.type     AS type,
-           st.category AS category,
-           count(r)    AS mentions,
-           count(DISTINCT (()-[:HAS_PARAGRAPH]->(p))) AS sessions
+         RETURN st.name AS name, st.type AS type, count(r) AS mentions
          ORDER BY mentions DESC
          LIMIT toInteger($limit)`,
         { type: type || '', mentionType: mention_type || '', limit: Math.min(limit, 100) }
@@ -369,116 +408,28 @@ const tools = [
     },
   },
 
-  // ── 7. List policy issues with counts ─────────────────────────────────────
+  // ── 9. List policy issues — DISCOVERY ────────────────────────────────────
   {
     name: 'list_issues',
+    retrieval: false,
     description:
-      'List all policy issues and sub-issues in the database ranked by how many paragraphs they cover. ' +
-      'Use to understand which topics are most legislated, or to discover issue codes before ' +
-      'running a targeted search. Also useful for questions like "quali sono i temi più trattati?".',
+      'List all policy issues ranked by paragraph count. ' +
+      'Use to discover available topics before a targeted search, ' +
+      'or to answer "quali sono i temi più trattati?".',
     input_schema: {
       type: 'object',
       properties: {
-        macro_area: {
-          type: 'string',
-          description: 'Optional filter by macro-area name (e.g. "Sicurezza", "Economia")',
-        },
+        macro_area: { type: 'string', description: 'Optional filter by macro-area (e.g. "Sicurezza", "Economia")' },
       },
     },
     handler: async ({ macro_area } = {}, driver) => {
       const where = macro_area ? 'WHERE toLower(i.issue) CONTAINS toLower($macroArea)' : '';
-      return cypher(
-        driver,
+      return cypher(driver,
         `MATCH (i:Issue)<-[:ABOUT]-(p:Paragraph)
          ${where}
-         RETURN
-           i.code     AS code,
-           i.issue    AS issue,
-           i.subIssue AS subIssue,
-           count(p)   AS paragraphs
+         RETURN i.code AS code, i.issue AS issue, i.subIssue AS subIssue, count(p) AS paragraphs
          ORDER BY paragraphs DESC`,
         { macroArea: macro_area || '' }
-      );
-    },
-  },
-
-  // ── 8. List sessions chronologically ─────────────────────────────────────
-  {
-    name: 'list_sessions',
-    description:
-      'List Council of Ministers sessions with their dates and official numbers. ' +
-      'Use when the user asks about a date range, wants to see the most recent sessions, ' +
-      'or needs to know which session number corresponds to a given date.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        limit: { type: 'integer', description: 'Max results (default 10)' },
-      },
-    },
-    handler: async ({ limit = 10 }, driver) => {
-      return cypher(
-        driver,
-        `MATCH (s:Session)
-         OPTIONAL MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
-         WITH s, count(p) AS paragraphs
-         RETURN
-           s.sessionId AS sessionId,
-           s.mainTitle AS title,
-           s.date      AS date,
-           s.url       AS url,
-           paragraphs
-         ORDER BY s.date DESC
-         LIMIT toInteger($limit)`,
-        { limit: Math.min(limit, 41) }
-      );
-    },
-  },
-
-  // ── 9. Industry impact analysis ───────────────────────────────────────────
-  {
-    name: 'search_by_industry',
-    description:
-      'Find paragraphs that impact a specific economic sector. ' +
-      'Industries: Finance | Energy & Utilities | Infrastructure & Transportation | ' +
-      'Manufacturing & Industrial Production | Healthcare | ' +
-      'Technology, Media & Telecommunications | ' +
-      'Professional Services & Education / Culture | Consumer Goods & Retail. ' +
-      'Use when the user asks about a specific sector (e.g. "banche", "energia", "sanità", "tech").',
-    input_schema: {
-      type: 'object',
-      properties: {
-        industry: {
-          type: 'string',
-          description: 'Industry name or keyword (e.g. "Finance", "Energy", "Healthcare")',
-        },
-        limit: { type: 'integer', description: 'Max results (default 10)' },
-      },
-      required: ['industry'],
-    },
-    handler: async ({ industry, limit = 10 }, driver) => {
-      return cypher(
-        driver,
-        `MATCH (ind:Industry)
-         WHERE toLower(ind.name) CONTAINS toLower($industry)
-         MATCH (p:Paragraph)-[:INVOLVES_INDUSTRY]->(ind)
-         MATCH (s:Session)-[:HAS_PARAGRAPH]->(p)
-         OPTIONAL MATCH (p)-[:ABOUT]->(i:Issue)
-         OPTIONAL MATCH (p)-[r:MENTIONS]->(st:Stakeholder)
-         WITH ind, s, p, i, collect(DISTINCT {name: st.name, role: r.role, mentionType: r.mentionType}) AS stakeholders
-         RETURN
-           ind.name                     AS industry,
-           p.title                      AS title,
-           p.date                       AS date,
-           s.sessionId                  AS sessionId,
-           s.mainTitle                  AS sessionTitle,
-           s.url                        AS url,
-           i.issue                      AS issue,
-           i.subIssue                   AS subIssue,
-           substring(p.content, 0, 400) AS contentPreview,
-           stakeholders
-         ORDER BY p.date DESC
-         LIMIT toInteger($limit)`,
-        { industry, limit: Math.min(limit, 20) }
       );
     },
   },

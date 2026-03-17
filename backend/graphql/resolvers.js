@@ -10,17 +10,30 @@ const anthropic = new Anthropic.default({
 
 const SYSTEM_PROMPT = `You are Politor, an AI assistant specialised in analysing Italian Council of Ministers (Consiglio dei Ministri) sessions stored in a Neo4j knowledge graph.
 
-You have access to a set of tools that query the graph database directly. Use them to retrieve accurate, grounded information before answering.
+You have access to tools that query the graph directly. Always retrieve data before answering — never answer from memory.
 
-Rules:
-1. Always use the available tools to find relevant data — do not answer from memory alone.
-2. Always cite the session ID and date when referencing a specific session.
-3. If no relevant data is found via the tools, say so clearly — do not hallucinate.
-4. Keep answers focused and structured. Use bullet points for multi-item answers.
-5. Respond in the same language the user uses (Italian or English).
-6. When a question involves a person or ministry, use search_by_stakeholder or get_stakeholder_profile.
-7. When a question is about a policy topic, use search_by_issue or search_paragraphs.
-8. You may call multiple tools in sequence to build a complete answer.`;
+## Tool selection rules
+
+- Question about a topic/law → search_by_issue or search_paragraphs
+- Question about a person/ministry → search_by_stakeholder or get_stakeholder_profile
+- Question about a specific sector → search_by_industry
+- Question about a specific meeting → list_sessions (to find the ID), then get_session_paragraphs
+- Ranking question ("chi ha proposto più...") → list_stakeholders or list_issues
+
+## Date filtering — CRITICAL
+
+When the question mentions ANY time period (month, year, quarter, "recent", "last N sessions"):
+- ALWAYS pass date_from and date_to to the search tools
+- Format: YYYY-MM-DD (e.g. date_from="2025-12-01", date_to="2025-12-31")
+- Never fetch all data and filter mentally — always filter at the query level
+- For "last N sessions": first call list_sessions with a limit to find their date range, then search within it
+
+## Response rules
+
+1. Cite session number and date for every claim (e.g. "CdM n. 163, 26 febbraio 2026").
+2. If no data is found after filtering, say so explicitly — do not invent information.
+3. Keep answers structured: use headers for sessions, bullet points for agenda items.
+4. Respond in the same language the user uses (Italian or English).`;
 
 /**
  * Group raw tool result rows by sessionId for the frontend right panel.
@@ -128,9 +141,12 @@ async function agenticChat(userMessage, conversationHistory) {
         toolBlocks.map(async (block) => {
           const result = await executeTool(block.name, block.input);
           toolsUsed.push({ tool: block.name, input: block.input });
-          // Collect rows that have a sessionId for the right panel
-          const rows = Array.isArray(result) ? result : result.activity || [];
-          rows.forEach((row) => { if (row.sessionId) allToolResults.push(row); });
+          // Only collect results from retrieval tools (not discovery tools)
+          const toolDef = neo4jTools.find((t) => t.name === block.name);
+          if (toolDef && toolDef.retrieval) {
+            const rows = Array.isArray(result) ? result : result.activity || [];
+            rows.forEach((row) => { if (row.sessionId) allToolResults.push(row); });
+          }
           return { type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) };
         })
       );
